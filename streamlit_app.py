@@ -12,23 +12,26 @@ def extract_name_from_pdf(reader):
     for page in reader.pages:
         full_text += page.extract_text() or ""
 
-    # Entferne bekannte Absender wie "Mondsee Finanz GmbH"
+    # Entferne bekannte Firmennamen
     full_text = full_text.replace("Mondsee Finanz GmbH", "")
 
-    # Suche nach einem typischen Namen, z. B. mittig im Dokument
-    matches = re.findall(r"\b([A-ZÄÖÜ][a-zäöüß]+)\s+([A-ZÄÖÜ][a-zäöüß]+)\b", full_text)
+    # Sucht nach einem Namen (2 Wörter) vor einer Adresse (Straße, Hausnummer, PLZ)
+    lines = full_text.split("\n")
+    for i in range(len(lines) - 2):
+        name_line = lines[i].strip()
+        address_line = lines[i + 1].strip()
+        plz_line = lines[i + 2].strip()
 
-    # Filtere bekannte Wörter oder Begriffe heraus
-    blacklist = {"Vertragsauskunft", "GmbH", "Herr", "Frau", "Straße", "Versicherung", "UNIQA"}
-
-    for vorname, nachname in matches:
-        if vorname not in blacklist and nachname not in blacklist:
+        if (re.match(r"^[A-ZÄÖÜ][a-zäöüß]+ [A-ZÄÖÜ][a-zäöüß]+$", name_line) and
+            re.search(r"(Straße|Weg|Gasse|Platz|Allee|Ring)", address_line) and
+            re.match(r"^\d{4,5} ", plz_line)):
+            vorname, nachname = name_line.split(" ", 1)
             return f"Vertragsauskunft {nachname}, {vorname}.pdf"
 
     return None
 
 st.title("📄 PDF-Umbenenner")
-st.write("Lade PDF-Dateien hoch – sie werden automatisch nach enthaltenem Kundennamen umbenannt und als ZIP-Datei zum Download bereitgestellt.")
+st.write("Lade PDF-Dateien hoch – sie werden automatisch nach dem Kundennamen (aus dem Adressblock) umbenannt und als ZIP-Datei zum Download bereitgestellt.")
 
 uploaded_files = st.file_uploader("PDF-Dateien auswählen", type=["pdf"], accept_multiple_files=True)
 
