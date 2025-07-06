@@ -1,7 +1,9 @@
+import os
+os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
+
 import streamlit as st
 from PyPDF2 import PdfReader, PdfWriter
 import tempfile
-import os
 import re
 import zipfile
 
@@ -10,22 +12,23 @@ def extract_name_from_pdf(reader):
     for page in reader.pages:
         full_text += page.extract_text() or ""
 
-    match = re.search(r"(Frau|Herr)\s+([A-ZÄÖÜ][a-zäöüß]+)\s+([A-ZÄÖÜ][a-zäöüß]+)", full_text)
-    if match:
-        vorname = match.group(2)
-        nachname = match.group(3)
-        return f"Vertragsauskunft {nachname} {vorname}.pdf"
+    # Entferne bekannte Absender wie "Mondsee Finanz GmbH"
+    full_text = full_text.replace("Mondsee Finanz GmbH", "")
 
-    match_alt = re.search(r"([A-ZÄÖÜ][a-zäöüß]+)\s+([A-ZÄÖÜ][a-zäöüß]+)", full_text)
-    if match_alt:
-        vorname = match_alt.group(1)
-        nachname = match_alt.group(2)
-        return f"Vertragsauskunft {nachname}, {vorname}.pdf"
+    # Suche nach einem typischen Namen, z. B. mittig im Dokument
+    matches = re.findall(r"\b([A-ZÄÖÜ][a-zäöüß]+)\s+([A-ZÄÖÜ][a-zäöüß]+)\b", full_text)
+
+    # Filtere bekannte Wörter oder Begriffe heraus
+    blacklist = {"Vertragsauskunft", "GmbH", "Herr", "Frau", "Straße", "Versicherung", "UNIQA"}
+
+    for vorname, nachname in matches:
+        if vorname not in blacklist and nachname not in blacklist:
+            return f"Vertragsauskunft {nachname}, {vorname}.pdf"
 
     return None
 
 st.title("📄 PDF-Umbenenner")
-st.write("Lade PDF-Dateien hoch – sie werden automatisch nach enthaltenem Namen umbenannt und als ZIP-Datei zum Download bereitgestellt.")
+st.write("Lade PDF-Dateien hoch – sie werden automatisch nach enthaltenem Kundennamen umbenannt und als ZIP-Datei zum Download bereitgestellt.")
 
 uploaded_files = st.file_uploader("PDF-Dateien auswählen", type=["pdf"], accept_multiple_files=True)
 
