@@ -14,7 +14,7 @@ def extract_name_from_pdf(reader):
     if match:
         vorname = match.group(2)
         nachname = match.group(3)
-        return f"Vertragsauskunft {nachname}, {vorname}.pdf"
+        return f"Vertragsauskunft {nachname} {vorname}.pdf"
 
     match_alt = re.search(r"([A-ZÄÖÜ][a-zäöüß]+)\s+([A-ZÄÖÜ][a-zäöüß]+)", full_text)
     if match_alt:
