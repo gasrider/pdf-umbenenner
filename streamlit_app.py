@@ -1,83 +1,85 @@
 import streamlit as st
-import fitz  # PyMuPDF
 import os
-import io
+import fitz  # PyMuPDF
 import zipfile
+import io
 import re
 from datetime import datetime
 
-st.set_page_config(page_title="PDF-Umbenenner nach Kundennamen", layout="centered")
-st.title("📄 PDF-Umbenenner nach Kundennamen")
+def extract_customer_name(pdf_path):
+    try:
+        doc = fitz.open(pdf_path)
+        page = doc[0]
+        blocks = page.get_text("dict")["blocks"]
+        name_candidates = []
 
-# Funktion: Text aus PDF extrahieren
-def extract_text_from_pdf(pdf_file):
-    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    return text
+        for block in blocks:
+            if "lines" in block and block["bbox"][1] < 300:  # Oberer Teil der Seite
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        text = span["text"].strip()
+                        if 300 < span["bbox"][0] < 550:  # Rechte obere Hälfte
+                            if (
+                                3 <= len(text.split()) <= 5 and
+                                not any(word.lower() in text.lower() for word in ["straße", "gasse", "versichert", "monatlich", "beginn", "vertrag", "geburtsdatum", "versnr", "finanz", "gmbh", "betrag", "eur"])
+                            ):
+                                name_candidates.append(text)
 
-# Funktion: Kundennamen erkennen
-def extract_customer_name(text):
-    lines = text.splitlines()
-    street_keywords = ["straße", "strasse", "weg", "gasse", "platz", "allee"]
-    
-    for i, line in enumerate(lines):
-        line_lower = line.lower()
-        if any(kw in line_lower for kw in street_keywords):
-            if i > 0:
-                candidate = lines[i - 1].strip()
-                if 1 <= len(candidate.split()) <= 4 and re.search(r"[A-Za-z]", candidate):
-                    return candidate
+        doc.close()
+        if name_candidates:
+            return name_candidates[0]
+        else:
+            return None
+    except Exception as e:
+        return None
 
-    # Fallback: Suche nach Zeile mit "Geb.datum"
-    for line in lines:
-        if "geb.datum" in line.lower():
-            match = re.split(r"[Gg]eb\.datum", line)
-            if len(match) > 0:
-                possible_name = match[0].strip()
-                name_parts = possible_name.split()
-                if 1 <= len(name_parts) <= 4:
-                    return possible_name
+def sanitize_filename(name):
+    # Entfernt unerwünschte Zeichen und ersetzt Leerzeichen durch _
+    return re.sub(r"[^\w\s-]", "", name).replace(" ", "").strip()
 
-    return "Kein_Name_Gefunden"
-
-# Funktion: PDF-Dateien umbenennen und zippen
-def rename_and_zip_pdfs(uploaded_files):
-    zip_buffer = io.BytesIO()
-
-    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED) as zip_file:
-        for uploaded_file in uploaded_files:
-            text = extract_text_from_pdf(uploaded_file)
-            name = extract_customer_name(text)
-
-            # Formatieren des Namens
-            name = re.sub(r"[^\w\s]", "", name)  # Sonderzeichen entfernen
-            name = name.replace(" ", "")  # Leerzeichen entfernen
-
-            new_filename = f"{name}.pdf"
-            zip_file.writestr(new_filename, uploaded_file.getvalue())
-
-    zip_buffer.seek(0)
-    return zip_buffer
-
-# Upload
-uploaded_files = st.file_uploader("🔼 Lade eine oder mehrere PDF-Dateien hoch", type=["pdf"], accept_multiple_files=True)
+st.title("📄 PDF Umbenenner nach Kundennamen")
+uploaded_files = st.file_uploader("PDF-Dateien hochladen", type="pdf", accept_multiple_files=True)
 
 if uploaded_files:
-    # Vorschau anzeigen (Name + Seiteninhalt)
-    with st.expander("📋 Vorschau der erkannten Namen (Klick zum Öffnen)"):
-        for file in uploaded_files:
-            text = extract_text_from_pdf(file)
-            name = extract_customer_name(text)
-            st.markdown(f"**{file.name} ➜ {name}**")
+    renamed_pdfs = []
+    errors = []
 
-    if st.button("📥 Umbenennen & ZIP-Datei herunterladen"):
-        zip_file = rename_and_zip_pdfs(uploaded_files)
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    with st.spinner("Verarbeite PDFs..."):
+        for uploaded_file in uploaded_files:
+            input_pdf = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+            temp_pdf_path = f"/tmp/{uploaded_file.name}"
+            input_pdf.save(temp_pdf_path)
+
+            name = extract_customer_name(temp_pdf_path)
+            if name:
+                filename = sanitize_filename(name) + ".pdf"
+            else:
+                filename = f"Unbekannt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                errors.append(uploaded_file.name)
+
+            buffer = io.BytesIO()
+            input_pdf.save(buffer)
+            buffer.seek(0)
+            renamed_pdfs.append((filename, buffer))
+
+    with io.BytesIO() as zip_buffer:
+        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+            for filename, pdf_buffer in renamed_pdfs:
+                zip_file.writestr(filename, pdf_buffer.read())
+        zip_buffer.seek(0)
+        st.success("✅ Umbenennung abgeschlossen.")
         st.download_button(
-            label="📦 Download ZIP",
-            data=zip_file,
-            file_name=f"umbenannte_pdfs_{timestamp}.zip",
+            label="📦 ZIP-Datei herunterladen",
+            data=zip_buffer,
+            file_name="umbenannte_pdfs.zip",
             mime="application/zip"
         )
+
+    st.subheader("📋 Vorschau der erkannten Namen")
+    for (filename, _), original_file in zip(renamed_pdfs, uploaded_files):
+        st.markdown(f"**{original_file.name}** ➝ `{filename}`")
+
+    if errors:
+        st.warning("⚠️ Bei folgenden Dateien konnte kein Name erkannt werden:")
+        for err in errors:
+            st.markdown(f"- {err}")
