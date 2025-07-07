@@ -1,57 +1,69 @@
-
 import streamlit as st
-import fitz  # PyMuPDF
 import os
+import re
+from pathlib import Path
+from PyPDF2 import PdfReader
+from io import BytesIO
+import zipfile
 
-def extract_customer_name_from_pdf_enhanced(file_path):
-    import re
-    address_keywords = ["straße", "weg", "gasse", "platz", "gürtel", "steig", "zeile", "siedlung"]
-    blacklist_keywords = ["versicherung", "vertragsauskunft", "beginn", "ablauf", "ag", "gmbh", "versicherungsmakler"]
-    fallback_pattern = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]+\s+[A-ZÄÖÜ][a-zäöüß]+(?:-[A-ZÄÖÜ][a-zäöüß]+)?\b")
+def extract_customer_name(text: str) -> str:
+    lines = text.splitlines()
 
-    doc = fitz.open(file_path)
-    for page in doc:
-        text = page.get_text("text")
-        lines = text.splitlines()
+    # 1. Firmenname mit GmbH, AG etc.
+    for line in lines:
+        if re.search(r"\b(GmbH|AG|KG|e\.U\.)\b", line) and "Mondsee Finanz" not in line:
+            return line.strip()
 
-        for i, line in enumerate(lines):
-            if any(kw in line.lower() for kw in address_keywords):
-                for offset in range(1, 4):
-                    name_index = i - offset
-                    if name_index < 0:
-                        continue
-                    candidate = lines[name_index].strip()
+    # 2. Geburtsdatum-Zeile -> Name davor
+    for line in lines:
+        if "Geb.datum" in line:
+            name = line.split("Geb.datum")[0].strip()
+            if len(name.split()) >= 2:
+                return name
 
-                    if (
-                        1 <= len(candidate.split()) <= 5 and
-                        any(c.isupper() for c in candidate) and
-                        not any(bkw in candidate.lower() for bkw in blacklist_keywords) and
-                        not candidate.strip().endswith(".")
-                    ):
-                        return candidate.replace(",", "")
+    # 3. E-Mail-Adresse -> Namen extrahieren
+    for line in lines:
+        email_match = re.search(r'([a-zA-Z0-9._%+-]+)@', line)
+        if email_match:
+            raw = email_match.group(1).replace(".", " ").replace("_", " ")
+            name = " ".join(w.capitalize() for w in raw.split())
+            return name
 
-        # Fallback: Suche nach klassischem Namen
-        fallback_matches = fallback_pattern.findall(text)
-        for match in fallback_matches:
-            if not any(bkw in match.lower() for bkw in blacklist_keywords):
-                return match.replace(",", "")
-    return None
+    # 4. Zeile vor Adresse erkennen (Straße etc.)
+    for i, line in enumerate(lines):
+        if re.search(r"\b(straße|strasse|weg|platz|gasse)\b", line.lower()) and i > 0:
+            return lines[i - 1].strip()
 
-st.title("PDF-Umbenenner nach Kundennamen")
+    return "Unbekannter Kunde"
 
-uploaded_files = st.file_uploader("Lade eine oder mehrere PDF-Dateien hoch", type=["pdf"], accept_multiple_files=True)
+def sanitize_filename(name: str) -> str:
+    name = name.replace(",", "")
+    name = re.sub(r"\s+", " ", name).strip()
+    return f"Vertragsauskunft {name}"
 
-if uploaded_files:
-    output_dir = "umbenannt"
-    os.makedirs(output_dir, exist_ok=True)
-    for uploaded_file in uploaded_files:
-        with open(uploaded_file.name, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        name = extract_customer_name_from_pdf_enhanced(uploaded_file.name)
-        if name:
-            new_filename = f"Vertragsauskunft {name}.pdf".replace(" ", "")
-        else:
-            new_filename = f"Vertragsauskunft_Unbekannt.pdf"
-        new_path = os.path.join(output_dir, new_filename)
-        os.rename(uploaded_file.name, new_path)
-        st.success(f"{uploaded_file.name} ➤ {new_filename}")
+def process_pdf(file) -> (str, BytesIO):
+    reader = PdfReader(file)
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    customer_name = extract_customer_name(text)
+    filename = sanitize_filename(customer_name) + ".pdf"
+    return filename, file
+
+def main():
+    st.title("PDF Umbenenner nach Kundennamen")
+    uploaded_files = st.file_uploader("PDF-Dateien hochladen", type=["pdf"], accept_multiple_files=True)
+
+    if uploaded_files:
+        with BytesIO() as zip_buffer:
+            with zipfile.ZipFile(zip_buffer, "w") as zipf:
+                for uploaded_file in uploaded_files:
+                    filename, filedata = process_pdf(uploaded_file)
+                    zipf.writestr(filename, filedata.read())
+            st.download_button(
+                label="ZIP-Datei mit umbenannten PDFs herunterladen",
+                data=zip_buffer.getvalue(),
+                file_name="umbenannte_pdfs.zip",
+                mime="application/zip"
+            )
+
+if __name__ == "__main__":
+    main()
