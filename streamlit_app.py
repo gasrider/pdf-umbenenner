@@ -1,7 +1,5 @@
 import streamlit as st
-import io
-import re
-import zipfile
+import io, re, zipfile
 from datetime import datetime
 
 import fitz       # PyMuPDF
@@ -10,15 +8,12 @@ from PIL import Image
 
 # ─── OCR / Textextraktion ────────────────────────────────────────────────────
 def extract_text_with_ocr(pdf_stream) -> str:
-    """
-    Versuche erst PDF-Text, sonst OCR via Tesseract.
-    """
     doc = fitz.open(stream=pdf_stream.read(), filetype="pdf")
     full_text = ""
     for page in doc:
-        block = page.get_text().strip()
-        if block:
-            full_text += block + "\n"
+        txt = page.get_text().strip()
+        if txt:
+            full_text += txt + "\n"
         else:
             pix = page.get_pixmap()
             img = Image.open(io.BytesIO(pix.tobytes()))
@@ -26,78 +21,72 @@ def extract_text_with_ocr(pdf_stream) -> str:
     doc.close()
     return full_text
 
-# ─── Bounding-Box Name-Detection mit Header-Blacklist ─────────────────────────
+# ─── Koordinaten‐Heuristik: Name im oberen Bereich, ohne Ziffern, ohne Header ──
 def extract_name_by_bbox(pdf_stream) -> str | None:
-    """
-    Durchsuche den oberen Bereich (10–30% Höhe) nach Namen, 
-    überspringe bekannte Header-Begriffe.
-    """
     pdf_stream.seek(0)
     doc = fitz.open(stream=pdf_stream.read(), filetype="pdf")
     page = doc[0]
-    height = page.rect.height
+    h = page.rect.height
     blocks = page.get_text("dict")["blocks"]
+    doc.close()
 
-    y_min, y_max = height * 0.10, height * 0.30
+    # wir schauen nur in 12–28 % der Seitenhöhe
+    y_min, y_max = h * 0.12, h * 0.28
 
-    # Header-Blacklist (kleingeschrieben)
-    blacklist = [
-        "mondsee", "finanz", "rainerstraße", "a-5310", "5310", "gmbh", "kundevertragsspiegel"
-    ]
-
+    # Header-Stichworte, danach entfernen
+    header_kw = ["mondsee", "finanz", "rainerstraße", "5310", "gmbh", "kundevertragsspiegel"]
     candidates = []
-    for block in blocks:
-        y0 = block["bbox"][1]
+
+    for blk in blocks:
+        y0 = blk["bbox"][1]
         if not (y_min < y0 < y_max):
             continue
 
-        # Block-Text zusammenführen
+        # ganzen Block‐Text holen
         text = " ".join(
-            span["text"] 
-            for line in block["lines"] 
-            for span in line["spans"]
+            span["text"] for line in blk["lines"] for span in line["spans"]
         ).strip()
+        txt_l = text.lower()
 
-        low = text.lower()
-        if any(hw in low for hw in blacklist):
+        # a) überspringe Header-Stichworte
+        if any(kw in txt_l for kw in header_kw):
+            continue
+        # b) überspringe Blöcke mit Ziffern (Adressen, Nummern)
+        if re.search(r"\d", text):
             continue
 
-        # Mehrfach-Whitespace bereinigen
+        # normalize spaces
         text = re.sub(r"\s+", " ", text)
 
-        # Muster: Person (2–5 Wörter, Großbuchstaben) oder Firma (endet auf GmbH)
-        if re.match(r"^[A-ZÄÖÜ][a-zäöüß]+(?: [A-ZÄÖÜ][a-zäöüß]+){1,4}$", text) \
-        or re.match(r"^[A-ZÄÖÜ].*GmbH$", text):
+        # Privatpersonen: 2–4 Wörter, jeder mit initial groß
+        if re.match(r"^[A-ZÄÖÜ][a-zäöüß]+(?: [A-ZÄÖÜ][a-zäöüß]+){1,3}$", text):
+            candidates.append(text)
+        # Firmen: enden auf GmbH
+        elif text.endswith("GmbH"):
             candidates.append(text)
 
-    doc.close()
     return candidates[0] if candidates else None
 
 # ─── Heuristische Fallbacks ─────────────────────────────────────────────────
 def extract_name_fallback(text: str) -> str | None:
-    """
-    1) Name über einer Adresszeile
-    2) Zeile mit 'Geb.datum'
-    3) Erste 5 Zeilen nach Vorname Nachname
-    """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     street_kw = ["straße","strasse","weg","gasse","platz","allee"]
 
-    # 1) Zeile über Adresse
+    # Zeile über Adresse
     for i, line in enumerate(lines):
-        if any(kw in line.lower() for kw in street_kw) and i > 0:
+        if any(kw in line.lower() for kw in street_kw) and i>0:
             cand = lines[i-1]
-            if 1 <= len(cand.split()) <= 4 and all(c.isalpha() or c.isspace() for c in cand):
+            if re.match(r"^[A-Za-zÄÖÜäöüß ]{5,40}$", cand):
                 return cand
 
-    # 2) Zeile mit Geburtsdatum
+    # Zeile mit Geburtsdatum
     for line in lines:
         if "geb.datum" in line.lower():
-            parts = line.split("Geb.datum")[0].strip()
-            if len(parts.split()) >= 2:
-                return parts
+            p = line.split("Geb.datum")[0].strip()
+            if re.match(r"^[A-Za-zÄÖÜäöüß ]{5,40}$", p):
+                return p
 
-    # 3) Erste fünf Zeilen: Vorname Nachname
+    # Erste 5 Zeilen Name
     for line in lines[:5]:
         if re.match(r"^[A-ZÄÖÜ][a-zäöüß]+ [A-ZÄÖÜ][a-zäöüß]+", line):
             return line
@@ -106,69 +95,59 @@ def extract_name_fallback(text: str) -> str | None:
 
 # ─── Gesamt-Extraktion ──────────────────────────────────────────────────────
 def extract_customer_name(pdf_stream) -> str:
-    # 1) Bounding-Box-Methode
-    name = extract_name_by_bbox(pdf_stream)
-    if name:
-        return name
-
+    # 1) Koordinaten-Heuristik
+    n = extract_name_by_bbox(pdf_stream)
+    if n:
+        return n
     # 2) OCR + Fallback
     pdf_stream.seek(0)
-    text = extract_text_with_ocr(pdf_stream)
-    name = extract_name_fallback(text)
-    if name:
-        return name
-
-    # 3) Letzter Ausweg
+    txt = extract_text_with_ocr(pdf_stream)
+    n2 = extract_name_fallback(txt)
+    if n2:
+        return n2
+    # 3) Fallback-Timestamp
     return f"Unbekannt_{datetime.now():%Y%m%d%H%M%S}"
 
-# ─── Dateinamen sanitisieren ──────────────────────────────────────────────────
+# ─── Dateiname bereinigen ────────────────────────────────────────────────────
 def sanitize_filename(name: str) -> str:
     return re.sub(r"[^\w]", "", name)
 
-# ─── Streamlit UI ───────────────────────────────────────────────────────────
+# ─── Streamlit-App ──────────────────────────────────────────────────────────
 st.set_page_config(page_title="PDF-Umbenenner", layout="centered")
-st.title("📄 PDF-Umbenenner mit OCR & Koordinaten-Heuristik")
+st.title("📄 PDF-Umbenenner mit OCR & verbessertem Header-Filter")
 
-uploaded = st.file_uploader(
-    "PDF-Dateien hochladen (max. 200 MB/Datei)",
-    type="pdf",
+uploads = st.file_uploader(
+    "PDFs hochladen (max. 200 MB/pro Datei)", 
+    type="pdf", 
     accept_multiple_files=True
 )
 
-if uploaded:
-    results, errors = [], []
-    with st.spinner("Verarbeitung läuft…"):
-        for pdf in uploaded:
+if uploads:
+    out, errs = [], []
+    with st.spinner("Bitte warten…"):
+        for pdf in uploads:
             pdf.seek(0)
-            cust = extract_customer_name(pdf)
-            if cust.startswith("Unbekannt_"):
-                errors.append(pdf.name)
-            safe = sanitize_filename(cust)
-            new_name = f"Vertragsauskunft{safe}.pdf"
+            name = extract_customer_name(pdf)
+            if name.startswith("Unbekannt_"):
+                errs.append(pdf.name)
+            safe = sanitize_filename(name)
+            new = f"Vertragsauskunft{safe}.pdf"
             pdf.seek(0)
-            data = pdf.read()
-            results.append((pdf.name, new_name, data))
+            out.append((pdf.name, new, pdf.read()))
 
-    # Vorschau
     st.subheader("🔍 Vorschau der neuen Dateinamen")
-    for orig, new, _ in results:
+    for orig, new, _ in out:
         st.write(f"• **{orig}** ➔ {new}")
 
-    # ZIP
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        for _, new, data in results:
+        for _, new, data in out:
             zf.writestr(new, data)
     buf.seek(0)
 
-    st.download_button(
-        "📦 ZIP herunterladen",
-        buf,
-        file_name="umbenannte_pdfs.zip",
-        mime="application/zip"
-    )
+    st.download_button("📦 ZIP herunterladen", buf, "umbenannte_pdfs.zip", "application/zip")
 
-    if errors:
-        st.warning("⚠️ Diese Dateien konnten nicht automatisch benannt werden:")
-        for e in errors:
+    if errs:
+        st.warning("⚠️ Kein Name gefunden für:")
+        for e in errs:
             st.write(f"- {e}")
