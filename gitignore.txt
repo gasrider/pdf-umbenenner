@@ -1,0 +1,4 @@
+uploads/
+umbenannt/
+*.zip
+__pycache__/
