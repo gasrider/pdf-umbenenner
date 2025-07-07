@@ -1,50 +1,59 @@
 import streamlit as st
 import os
-import io
+import fitz  # PyMuPDF
 import zipfile
-from PyPDF2 import PdfReader
 import re
 
-def extract_customer_name(text):
-    ignore_keywords = ["GmbH", "Versicherung", "Finanz", "UNIQA", "AG", "Gesellschaft", "OG", "mbH", "Mondsee"]
-    lines = text.splitlines()
-    for line in lines:
-        line = line.strip()
-        if not line or any(keyword in line for keyword in ignore_keywords):
-            continue
-        if re.match(r"^[A-ZÄÖÜ][a-zäöüß]+\s+[A-ZÄÖÜ][a-zäöüß]+$", line):
-            return line
+def extract_name_from_text(text):
+    # Suche nach zwei aufeinanderfolgenden Groß-/Kleinwörtern, die keine Firmennamen enthalten
+    lines = text.split('\n')
+    for i in range(len(lines) - 1):
+        line1 = lines[i].strip()
+        line2 = lines[i + 1].strip()
+        full_name = f"{line1} {line2}"
+
+        if (
+            re.match(r'^[A-ZÄÖÜ][a-zäöüß]+\s[A-ZÄÖÜ][a-zäöüß]+$', full_name) and
+            "GmbH" not in full_name and
+            "Versicherung" not in full_name and
+            "Finanz" not in full_name
+        ):
+            return full_name
+
     return None
 
-def main():
-    st.set_page_config(page_title="PDF-Umbenenner", page_icon="📄")
-    st.title("📄 PDF-Umbenenner nach Kundennamen")
-    st.write("Lade PDF-Dateien hoch – sie werden automatisch nach dem Kundennamen (aus dem Adressblock) umbenannt und als ZIP-Datei zum Download bereitgestellt.")
+def process_pdf(uploaded_file):
+    doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+    first_page = doc.load_page(0)
+    text = first_page.get_text()
+    name = extract_name_from_text(text)
+    return name
 
-    uploaded_files = st.file_uploader("PDF-Dateien hochladen", type=["pdf"], accept_multiple_files=True)
-    if uploaded_files:
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED) as zip_file:
-            for uploaded_file in uploaded_files:
-                pdf_reader = PdfReader(uploaded_file)
-                text = ""
-                for page in pdf_reader.pages:
-                    text += page.extract_text() or ""
-                name = extract_customer_name(text)
-                if name:
-                    name = name.replace(",", "")
-                    new_filename = f"Vertragsauskunft {name}.pdf"
-                    zip_file.writestr(new_filename, uploaded_file.read())
-                    st.success(f"{uploaded_file.name} → {new_filename}")
-                else:
-                    st.warning(f"⚠️ Kein Name gefunden in: {uploaded_file.name}")
+st.title("📄 PDF-Umbenenner nach Kundennamen")
+st.write("Lade PDF-Dateien hoch – sie werden automatisch nach dem Kundennamen (aus dem Adressblock) umbenannt und als ZIP-Datei zum Download bereitgestellt.")
 
-        st.download_button(
-            label="📦 ZIP-Datei herunterladen",
-            data=zip_buffer.getvalue(),
-            file_name="umbenannte_pdfs.zip",
-            mime="application/zip"
-        )
+uploaded_files = st.file_uploader("PDF-Dateien hochladen", type="pdf", accept_multiple_files=True)
+if uploaded_files:
+    if not os.path.exists("umbenannt"):
+        os.makedirs("umbenannt")
 
-if __name__ == "__main__":
-    main()
+    with zipfile.ZipFile("umbenannt.zip", "w") as zipf:
+        for uploaded_file in uploaded_files:
+            name = process_pdf(uploaded_file)
+            uploaded_file.seek(0)
+
+            if name:
+                clean_name = name.replace(",", "").replace(" ", "_")
+                new_filename = f"Vertragsauskunft_{clean_name}.pdf"
+                file_path = os.path.join("umbenannt", new_filename)
+
+                with open(file_path, "wb") as f:
+                    f.write(uploaded_file.read())
+
+                zipf.write(file_path, arcname=new_filename)
+                st.success(f"{uploaded_file.name} → {new_filename}")
+            else:
+                st.warning(f"⚠️ Kein Name gefunden in: {uploaded_file.name}")
+
+    with open("umbenannt.zip", "rb") as f:
+        st.download_button("📦 ZIP-Datei herunterladen", f, file_name="umbenannt.zip")
