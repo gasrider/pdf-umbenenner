@@ -1,0 +1,6 @@
+streamlit
+pytesseract
+Pillow
+spacy
+de-core-news-sm
+pymupdf
