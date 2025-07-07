@@ -7,7 +7,6 @@ from datetime import datetime
 
 # ─── OCR auf einem Bild-Pillow-Objekt ─────────────────────────────────────────
 def ocr_image(img: Image.Image) -> str:
-    # Tesseract mit deutschem Sprachpaket
     return pytesseract.image_to_string(img, lang="deu")
 
 # ─── PageCrop + OCR ──────────────────────────────────────────────────────────
@@ -45,11 +44,13 @@ def extract_customer_name(pdf_bytes: bytes) -> str:
     text = ocr_crop(page, (0.45, 0.12, 0.85, 0.20))
     name = find_name_in_text(text)
     if name:
+        doc.close()
         return name
 
     # 2) Weiter Box (OCR-Fallback)
     text2 = ocr_crop(page, (0.10, 0.20, 0.90, 0.40))
     name2 = find_name_in_text(text2)
+    doc.close()
     if name2:
         return name2
 
