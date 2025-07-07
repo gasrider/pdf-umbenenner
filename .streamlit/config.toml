@@ -1,2 +1,7 @@
-[runner]
-mainModule = "main/streamlit_app.py"
+[server]
+# ab Streamlit 1.10+ keine runner.mainModule mehr, 
+# stattdessen:
+script = "app.py"
+headless = true
+enableCORS = false
+port = 8501
