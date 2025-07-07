@@ -4,31 +4,28 @@ import re
 import zipfile
 from datetime import datetime
 
-import fitz  # PyMuPDF
+import fitz       # PyMuPDF
 import pytesseract
 from PIL import Image
 
 import spacy
-from spacy.cli import download as spacy_download
 
 # ─── SpaCy-Setup ──────────────────────────────────────────────────────────────
-# Versuche, das deutsche Modell zu laden, lade es bei Bedarf nach
-try:
-    nlp = spacy.load("de_core_news_sm")
-except OSError:
-    spacy_download("de_core_news_sm")
-    nlp = spacy.load("de_core_news_sm")
+# Modell "de_core_news_sm" wird via requirements.txt beim Build installiert
+nlp = spacy.load("de_core_news_sm")
 
 
-# ─── Textextraktion mit OCR-Fallback ────────────────────────────────────────────
+# ─── Textextraktion mit OCR-Fallback ──────────────────────────────────────────
 def extract_text_with_ocr(pdf_stream) -> str:
-    """Extrahiere Text aus PDF; bei leeren Seiten OCR via Tesseract."""
+    """
+    Versuche erst PDF-Text, sonst OCR via Tesseract.
+    """
     doc = fitz.open(stream=pdf_stream.read(), filetype="pdf")
     full_text = ""
     for page in doc:
-        text = page.get_text().strip()
-        if text:
-            full_text += text + "\n"
+        block = page.get_text().strip()
+        if block:
+            full_text += block + "\n"
         else:
             pix = page.get_pixmap()
             img = Image.open(io.BytesIO(pix.tobytes()))
@@ -40,7 +37,9 @@ def extract_text_with_ocr(pdf_stream) -> str:
 
 # ─── Named-Entity-Recognition mittels SpaCy ──────────────────────────────────
 def extract_name_ner(text: str) -> str | None:
-    """Nutze SpaCy, um zuerst ORG (Firmen), dann PER (Personen) zu finden."""
+    """
+    Suche im gesamten Text nach ORG (Firmen) oder PER (Personen).
+    """
     doc = nlp(text)
     for ent in doc.ents:
         if ent.label_ == "ORG":
@@ -53,10 +52,15 @@ def extract_name_ner(text: str) -> str | None:
 
 # ─── Heuristische Namenssuche als Fallback ───────────────────────────────────
 def extract_name_fallback(text: str) -> str:
-    """Fallback-Strategien: Adresse, Geb.datum, Top-5-Zeilen."""
+    """
+    Fallback-Methoden:
+    1) Zeile über Adresse
+    2) Zeile mit 'Geb.datum'
+    3) Erste fünf Zeilen auf Vorname Nachname prüfen
+    """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     street_kw = ["straße", "strasse", "weg", "gasse", "platz", "allee"]
-    
+
     # 1) Zeile direkt über einer Adresszeile
     for i, line in enumerate(lines):
         lw = line.lower()
@@ -77,25 +81,35 @@ def extract_name_fallback(text: str) -> str:
         if re.match(r"^[A-ZÄÖÜ][a-zäöüß]+ [A-ZÄÖÜ][a-zäöüß]+", line):
             return line
 
-    # Kein Name gefunden
-    return "Kein_Name_Gefunden"
+    return None
 
 
 # ─── Hauptfunktion zur Namensextraktion ──────────────────────────────────────
 def extract_customer_name(pdf_stream) -> str:
-    """Kombiniere NER und Fallback-Methoden."""
+    """
+    Kombiniere OCR, NER und Heuristiken.
+    """
     text = extract_text_with_ocr(pdf_stream)
-    # 0) NER
+
+    # 0) NER-basiert
     name = extract_name_ner(text)
     if name:
         return name
+
     # 1–3) Fallback
-    return extract_name_fallback(text)
+    name = extract_name_fallback(text)
+    if name:
+        return name
+
+    # 4) Letzter Ausweg
+    return f"Unbekannt_{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
 
-# ─── Dateinamen-Bereinigung ──────────────────────────────────────────────────
+# ─── Dateinamen bereinigen ───────────────────────────────────────────────────
 def sanitize_filename(name: str) -> str:
-    """Entferne Sonderzeichen und Leerzeichen."""
+    """
+    Entferne Sonderzeichen und Leerzeichen für Dateinamen.
+    """
     clean = re.sub(r"[^\w\s-]", "", name)
     return clean.replace(" ", "")
 
@@ -105,7 +119,7 @@ st.set_page_config(page_title="PDF-Umbenenner mit OCR & NER", layout="centered")
 st.title("📄 PDF-Umbenenner mit SpaCy-NER & OCR")
 
 uploaded_files = st.file_uploader(
-    "PDF-Dateien hochladen (max. 200 MB/pro Datei)", 
+    "PDF-Dateien hochladen (max. 200 MB pro Datei)", 
     type="pdf", 
     accept_multiple_files=True
 )
@@ -114,27 +128,24 @@ if uploaded_files:
     results = []
     errors = []
 
-    with st.spinner("Verarbeite PDF-Dateien..."):
+    with st.spinner("Verarbeite PDF-Dateien…"):
         for pdf_file in uploaded_files:
-            # Extrahiere Namen
             pdf_file.seek(0)
-            name = extract_customer_name(pdf_file)
+            extracted_name = extract_customer_name(pdf_file)
 
-            if not name or name == "Kein_Name_Gefunden":
-                # Fallback bei gar keinem Treffer
-                name = f"Unbekannt_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                errors.append(pdf_file.name)
-
-            # Erzeuge neuen Dateinamen
-            base = sanitize_filename(name)
+            # Generiere finalen Dateinamen
+            base = sanitize_filename(extracted_name)
             new_filename = f"Vertragsauskunft{base}.pdf"
 
-            # Lies die Bytes erneut
+            # Speichere Ergebnis
             pdf_file.seek(0)
             data = pdf_file.read()
             results.append((pdf_file.name, new_filename, data))
 
-    # Vorschau erkannter Namen
+            if extracted_name.startswith("Unbekannt_"):
+                errors.append(pdf_file.name)
+
+    # Vorschau erkannter Dateinamen
     st.subheader("🔍 Vorschau erkannter Dateinamen")
     for orig, new, _ in results:
         st.write(f"• **{orig}** ➔ {new}")
@@ -154,8 +165,7 @@ if uploaded_files:
         mime="application/zip"
     )
 
-    # Fehlermeldungen
     if errors:
-        st.warning("⚠️ Für diese Dateien konnte kein Name extrahiert werden:")
+        st.warning("⚠️ Für diese Dateien konnte kein verlässlicher Name extrahiert werden:")
         for fn in errors:
             st.write(f"- {fn}")
