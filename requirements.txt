@@ -1,4 +1,6 @@
+# requirements.txt
 streamlit
 pymupdf
 pytesseract
 Pillow
+spacy
