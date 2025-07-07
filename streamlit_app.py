@@ -8,28 +8,26 @@ from io import BytesIO
 
 st.set_page_config(page_title="PDF-Umbenenner", page_icon="📄")
 st.title("📄 PDF-Umbenenner nach Kundennamen")
-st.markdown("Erkennt Kundennamen aus PDF-Dokumenten – Firmen oder Privatpersonen.")
+st.markdown("Erkennt Kundennamen oberhalb der Adresse – Firmen oder Privatpersonen.")
 
 uploaded_files = st.file_uploader("PDF-Dateien hochladen", type="pdf", accept_multiple_files=True)
 
-# Diese Namen sollen ignoriert werden (z. B. Absender)
-ABZUSCHNEIDEN = {"Mondsee Finanz GmbH", "UNIQA Österreich Versicherungen AG"}
+# Absender, die ignoriert werden sollen
+IGNORED_LINES = {"Mondsee Finanz GmbH", "UNIQA Österreich Versicherungen AG"}
+
+# Adressmuster zum Erkennen (Deutsch)
+ADDRESS_KEYWORDS = r"\b(straße|strasse|gasse|weg|platz|allee|ring|gürtel|siedlung|zeile)\b"
 
 def extract_customer_name(text: str) -> str | None:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    lines = [line for line in lines if line not in ABZUSCHNEIDEN]
+    lines = [line for line in lines if line not in IGNORED_LINES]
 
-    for i, line in enumerate(lines):
-        # Sonderfall Firmenname mit GmbH, OG, etc.
-        if re.search(r'\b(GmbH|AG|OG|KG|e\.U\.)\b', line) and not any(ign in line for ign in ABZUSCHNEIDEN):
-            return line
-
-        # Privatperson über Adresse
-        if i + 1 < len(lines):
-            next_line = lines[i + 1].lower()
-            if re.search(r'\bstraße\b|\bstrasse\b|\bweg\b|\bplatz\b|\bgasse\b', next_line):
-                if re.match(r'^[A-ZÄÖÜ][a-zäöüß]+ [A-ZÄÖÜ][a-zäöüß]+$', line):
-                    return line
+    for i in range(1, len(lines)):
+        current_line = lines[i].lower()
+        if re.search(ADDRESS_KEYWORDS, current_line):
+            possible_name = lines[i - 1]
+            if 3 <= len(possible_name) <= 60:  # Minimale Länge, um irrelevante Zeilen auszuschließen
+                return possible_name
     return None
 
 if uploaded_files:
@@ -45,8 +43,8 @@ if uploaded_files:
         name = extract_customer_name(text)
 
         if name:
-            name_clean = re.sub(r'[^\wäöüÄÖÜß\s-]', '', name).strip()
-            name_clean = re.sub(r'\s+', ' ', name_clean)
+            name_clean = re.sub(r'[^\wäöüÄÖÜß\s-]', '', name)  # keine Sonderzeichen
+            name_clean = re.sub(r'\s+', ' ', name_clean).strip()
             new_filename = f"Vertragsauskunft {name_clean}.pdf"
             output_path = os.path.join(output_dir, new_filename)
             with open(output_path, "wb") as f_out:
@@ -55,6 +53,7 @@ if uploaded_files:
         else:
             messages.append(f"⚠️ Kein Kundenname gefunden in: {file.name}")
 
+    # ZIP-Datei erstellen
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, "w") as zip_file:
         for filename in os.listdir(output_dir):
