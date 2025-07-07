@@ -1,69 +1,75 @@
 import streamlit as st
+import fitz  # PyMuPDF
 import os
 import re
-from pathlib import Path
-from PyPDF2 import PdfReader
-from io import BytesIO
-import zipfile
+import tempfile
+from zipfile import ZipFile
 
-def extract_customer_name(text: str) -> str:
-    lines = text.splitlines()
+st.set_page_config(page_title="PDF-Umbenenner", layout="centered")
 
-    # 1. Firmenname mit GmbH, AG etc.
-    for line in lines:
-        if re.search(r"\b(GmbH|AG|KG|e\.U\.)\b", line) and "Mondsee Finanz" not in line:
-            return line.strip()
+st.title("📄 PDF Umbenenner nach Kundennamen")
+st.caption("PDF-Dateien hochladen")
 
-    # 2. Geburtsdatum-Zeile -> Name davor
-    for line in lines:
-        if "Geb.datum" in line:
-            name = line.split("Geb.datum")[0].strip()
-            if len(name.split()) >= 2:
-                return name
+uploaded_files = st.file_uploader("Drag and drop files here", type=["pdf"], accept_multiple_files=True)
 
-    # 3. E-Mail-Adresse -> Namen extrahieren
-    for line in lines:
-        email_match = re.search(r'([a-zA-Z0-9._%+-]+)@', line)
-        if email_match:
-            raw = email_match.group(1).replace(".", " ").replace("_", " ")
-            name = " ".join(w.capitalize() for w in raw.split())
-            return name
+def extract_customer_name(text):
+    lines = text.split("\n")
+    lines = [line.strip() for line in lines if line.strip()]
 
-    # 4. Zeile vor Adresse erkennen (Straße etc.)
+    address_keywords = ["straße", "weg", "gasse", "platz", "gürtel", "steig", "zeile", "siedlung", "top"]
+    blacklist_keywords = ["versicherung", "vertragsauskunft", "beginn", "ablauf", "ag", "gmbh", "versicherungsmakler"]
+
     for i, line in enumerate(lines):
-        if re.search(r"\b(straße|strasse|weg|platz|gasse)\b", line.lower()) and i > 0:
-            return lines[i - 1].strip()
+        for word in address_keywords:
+            if word in line.lower():
+                for offset in range(1, 4):
+                    if i - offset >= 0:
+                        possible_name = lines[i - offset]
+                        if all(bw not in possible_name.lower() for bw in blacklist_keywords):
+                            return possible_name.replace(",", "").strip()
+    return None
 
-    return "Unbekannter Kunde"
+if uploaded_files:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result_paths = []
+        umbenennungen = []
 
-def sanitize_filename(name: str) -> str:
-    name = name.replace(",", "")
-    name = re.sub(r"\s+", " ", name).strip()
-    return f"Vertragsauskunft {name}"
+        for file in uploaded_files:
+            original_path = os.path.join(tmpdir, file.name)
+            with open(original_path, "wb") as f:
+                f.write(file.getbuffer())
 
-def process_pdf(file) -> (str, BytesIO):
-    reader = PdfReader(file)
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    customer_name = extract_customer_name(text)
-    filename = sanitize_filename(customer_name) + ".pdf"
-    return filename, file
+            doc = fitz.open(original_path)
+            text = ""
+            for page in doc:
+                text += page.get_text()
+            doc.close()
 
-def main():
-    st.title("PDF Umbenenner nach Kundennamen")
-    uploaded_files = st.file_uploader("PDF-Dateien hochladen", type=["pdf"], accept_multiple_files=True)
+            customer_name = extract_customer_name(text)
+            if not customer_name:
+                customer_name = "Kundevertrag"
 
-    if uploaded_files:
-        with BytesIO() as zip_buffer:
-            with zipfile.ZipFile(zip_buffer, "w") as zipf:
-                for uploaded_file in uploaded_files:
-                    filename, filedata = process_pdf(uploaded_file)
-                    zipf.writestr(filename, filedata.read())
+            safe_name = customer_name.replace(" ", "").replace(",", "")
+            new_filename = f"Vertragsauskunft{safe_name}.pdf"
+            new_path = os.path.join(tmpdir, new_filename)
+            os.rename(original_path, new_path)
+            result_paths.append((new_filename, new_path))
+            umbenennungen.append(f"{file.name} ➜ {new_filename}")
+
+        zip_path = os.path.join(tmpdir, "umbenannte_pdfs.zip")
+        with ZipFile(zip_path, "w") as zipf:
+            for filename, path in result_paths:
+                zipf.write(path, arcname=filename)
+
+        st.markdown("**🔍 Vorschau der umbenannten Dateien:**")
+        for umbenennung in umbenennungen:
+            st.write(f"• {umbenennung}")
+
+        with open(zip_path, "rb") as f:
             st.download_button(
-                label="ZIP-Datei mit umbenannten PDFs herunterladen",
-                data=zip_buffer.getvalue(),
+                label="📥 ZIP-Datei mit umbenannten PDFs herunterladen",
+                data=f,
                 file_name="umbenannte_pdfs.zip",
                 mime="application/zip"
             )
 
-if __name__ == "__main__":
-    main()
