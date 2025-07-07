@@ -2,5 +2,6 @@ streamlit
 pymupdf
 pytesseract
 Pillow
-spacy
-de-core-news-sm
+
+spacy>=3.5.0
+de-core-news-sm @ https://github.com/explosion/spacy-models/releases/download/de_core_news_sm-3.5.0/de_core_news_sm-3.5.0-py3-none-any.whl
