@@ -23,7 +23,7 @@ def extract_name_from_pdf(reader):
         if (re.search(r"(straße|weg|gasse|platz|allee|ring)", line2, re.IGNORECASE) and
             re.match(r"^\d{4,5} ", line3)):
             if re.match(r"^[A-ZÄÖÜ][a-zäöüß]+ [A-ZÄÖÜ][a-zäöüß]+$", line1):
-                vorname, nachname = line1.split(" ", 1)
+                vorname nachname = line1.split(" ", 1)
                 return f"Vertragsauskunft {vorname} {nachname}.pdf"
 
     return None
