@@ -1,6 +1,6 @@
-# requirements.txt
 streamlit
 pymupdf
 pytesseract
 Pillow
 spacy
+de-core-news-sm
