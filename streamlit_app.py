@@ -1,4 +1,3 @@
-
 import streamlit as st
 import fitz  # PyMuPDF
 import os
@@ -8,7 +7,7 @@ import zipfile
 st.set_page_config(page_title="PDF-Umbenenner nach Kundennamen")
 
 st.title("📄 PDF-Umbenenner nach Kundennamen")
-st.write("Lade PDF-Dateien hoch – sie werden automatisch nach dem Kundennamen (aus dem Adressblock) umbenannt und als ZIP-Datei zum Download bereitgestellt.")
+st.write("Lade PDF-Dateien hoch – sie werden automatisch nach dem Kundennamen (über dem Adressblock) umbenannt und als ZIP-Datei bereitgestellt.")
 
 uploaded_files = st.file_uploader("PDF-Dateien hochladen", type=["pdf"], accept_multiple_files=True)
 output_dir = "umbenannt"
@@ -19,12 +18,18 @@ def extract_name_from_text(text):
     for i, line in enumerate(lines):
         if "straße" in line.lower() and i > 0:
             name_line = lines[i - 1].strip()
-            if name_line and all(c.isalpha() or c.isspace() for c in name_line):
+            # Firmen und irrelevante Zeilen überspringen
+            if any(word in name_line.lower() for word in ["gmbh", "versicherung", "mondsee", "finanz"]):
+                continue
+            # Nur Zeilen mit zwei Wörtern (typischerweise Vorname + Nachname)
+            parts = name_line.split()
+            if len(parts) == 2 and all(p[0].isupper() for p in parts):
                 return name_line
     return None
 
 def sanitize_filename(name):
-    return "".join(c for c in name if c.isalnum() or c.isspace()).rstrip()
+    # Entfernt unerlaubte Zeichen
+    return "".join(c for c in name if c.isalnum() or c.isspace()).strip()
 
 if uploaded_files:
     zip_buffer = io.BytesIO()
@@ -40,7 +45,7 @@ if uploaded_files:
                     output_path = os.path.join(output_dir, new_filename)
                     doc.save(output_path)
                     zipf.write(output_path, arcname=new_filename)
-                    st.success(f"{uploaded_file.name} -> {new_filename}")
+                    st.success(f"{uploaded_file.name} ➜ {new_filename}")
                 else:
                     st.warning(f"⚠️ Kein Name gefunden in: {uploaded_file.name}")
             except Exception as e:
