@@ -5,12 +5,33 @@ import re
 import zipfile
 from datetime import datetime
 
-# ─── 1) Textblöcke sortieren ───────────────────────────────────────────────
+# ─── 1) Kopfbereich-Blacklist ────────────────────────────────────────────────
+def collect_header_blacklist(pdf_bytes: bytes) -> set[str]:
+    """Sammelt alle Textblöcke aus den oberen 20% als Blacklist."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[0]
+    cutoff = page.rect.height * 0.20
+    raw = page.get_text("dict")["blocks"]
+    doc.close()
+
+    bl = set()
+    for blk in raw:
+        if blk.get("type") != 0 or "lines" not in blk:
+            continue
+        y0 = blk["bbox"][1]
+        if y0 > cutoff:
+            continue
+        text = " ".join(
+            span["text"] for line in blk["lines"] for span in line["spans"]
+        ).strip()
+        text = re.sub(r"\s+", " ", text)
+        if text:
+            bl.add(text)
+    return bl
+
+# ─── 2) Textblöcke sortieren ─────────────────────────────────────────────────
 def get_sorted_blocks(pdf_bytes: bytes):
-    """
-    Liefert eine Liste (y0, text) aller Textblöcke auf Seite 1,
-    sortiert von oben (kleines y0) nach unten (großes y0).
-    """
+    """Gibt eine Liste (y0, x0, text) aller Textblöcke auf Seite 1, sortiert nach y0."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
     raw = page.get_text("dict")["blocks"]
@@ -20,107 +41,118 @@ def get_sorted_blocks(pdf_bytes: bytes):
     for blk in raw:
         if blk.get("type") != 0 or "lines" not in blk:
             continue
-        y0 = blk["bbox"][1]
+        y0, x0 = blk["bbox"][1], blk["bbox"][0]
         text = " ".join(
             span["text"] for line in blk["lines"] for span in line["spans"]
         ).strip()
         text = re.sub(r"\s+", " ", text)
         if text:
-            blocks.append((y0, text))
+            blocks.append((y0, x0, text))
     return sorted(blocks, key=lambda t: t[0])
 
-# ─── 2) Persönlichen Namen oberhalb der Adresse finden ──────────────────────
-def extract_personal_name(pdf_bytes: bytes) -> str | None:
-    """
-    Sucht in den sortierten Blöcken nach einer Adresszeile (enthält Straße o.ä.).
-    Gibt den Block direkt darüber zurück, wenn er genau aus zwei Wörtern besteht
-    und beide mit Großbuchstaben beginnen.
-    """
-    blocks = get_sorted_blocks(pdf_bytes)
-    street_keywords = ["straße", "strasse", "weg", "gasse", "platz", "allee"]
-    name_pattern = re.compile(r"^[A-ZÄÖÜ][a-zäöüß]+ [A-ZÄÖÜ][a-zäöüß]+$")
+# ─── 3) Adressblock erkennen ────────────────────────────────────────────────
+def is_address_block(text: str) -> bool:
+    low = text.lower()
+    street_kw = ["straße","strasse","weg","gasse","platz","allee"]
+    if any(kw in low for kw in street_kw):
+        return True
+    # Postleitzahl + Stadt, z.B. "5163 Mattsee"
+    if re.match(r"^\d{4}\s+[A-Za-zÄÖÜäöüß\- ]+$", text):
+        return True
+    return False
 
-    for idx, (_, text) in enumerate(blocks):
-        low = text.lower()
-        if any(kw in low for kw in street_keywords):
+# ─── 4) Name-Block erkennen ──────────────────────────────────────────────────
+def is_name_block(text: str) -> bool:
+    """
+    2–5 Tokens, jeder beginnt mit Großbuchstaben,
+    erlaubt Punkte/Bindestriche (für Titel/Doppelnamen).
+    """
+    tokens = text.split()
+    if not (2 <= len(tokens) <= 5):
+        return False
+    for tok in tokens:
+        if not re.match(r"^[A-ZÄÖÜ][A-Za-zäöüß\.\-]+$", tok):
+            return False
+    return True
+
+# ─── 5) Persönlichen Namen oberhalb der Adresse ziehen ──────────────────────
+def extract_personal_name(pdf_bytes: bytes, blacklist: set[str]) -> str | None:
+    blocks = get_sorted_blocks(pdf_bytes)
+    for idx, (_, x0, text) in enumerate(blocks):
+        if text in blacklist:
+            continue
+        if is_address_block(text):
+            # Kandidat direkt darüber
             if idx > 0:
-                cand = blocks[idx - 1][1].strip()
-                if name_pattern.match(cand):
+                cand = blocks[idx-1][2].strip()
+                if cand not in blacklist and not re.search(r"\d", cand) and is_name_block(cand):
                     return cand
     return None
 
-# ─── 3) Fallback: Name vor „Geb.datum“ oder in Top-5-Zeilen ──────────────
+# ─── 6) Fallback über Gesamttext ────────────────────────────────────────────
 def extract_fallback_name(pdf_bytes: bytes) -> str | None:
-    full_text = ""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    for page in doc:
-        full_text += page.get_text() + "\n"
+    full = "".join(page.get_text() + "\n" for page in doc)
     doc.close()
-
-    lines = [l.strip() for l in full_text.splitlines() if l.strip()]
-    name_pattern = re.compile(r"^[A-ZÄÖÜ][a-zäöüß]+ [A-ZÄÖÜ][a-zäöüß]+$")
-
-    # a) Zeile vor „Geb.datum“
+    lines = [l.strip() for l in full.splitlines() if l.strip()]
+    # a) Zeile vor 'Geb.datum'
     for line in lines:
         if "geb.datum" in line.lower():
             cand = line.split("geb.datum")[0].strip()
-            if name_pattern.match(cand):
+            if is_name_block(cand):
                 return cand
-
-    # b) Erste fünf Zeilen
+    # b) Erste 5 Zeilen
     for line in lines[:5]:
-        if name_pattern.match(line):
+        if is_name_block(line):
             return line
-
     return None
 
-# ─── 4) Vollständige Extraktion ─────────────────────────────────────────────
+# ─── 7) Komplett-Logik für Kundennamen ─────────────────────────────────────
 def extract_customer_name(pdf_bytes: bytes) -> str:
-    # 1) persönlicher Name oberhalb Adresse
-    name = extract_personal_name(pdf_bytes)
-    if name:
-        return name
+    header_bl = collect_header_blacklist(pdf_bytes)
 
-    # 2) Fallback
+    # 1) Persönlicher Name > Adresse
+    n = extract_personal_name(pdf_bytes, header_bl)
+    if n:
+        return n
+
+    # 2) Heuristischer Fallback
     fb = extract_fallback_name(pdf_bytes)
     if fb:
         return fb
 
     # 3) letzter Ausweg
-    return f"Unbekannt_{datetime.now():%Y%m%d_%H%M%S}"
+    return f"Unbekannt_{datetime.now():%Y%m%d%H%M%S}"
 
-# ─── 5) Dateinamen bereinigen ───────────────────────────────────────────────
+# ─── 8) Datei-Name bereinigen ───────────────────────────────────────────────
 def sanitize_filename(name: str) -> str:
     return re.sub(r"[^\w\s]", "", name).strip()
 
-# ─── 6) Streamlit-App ───────────────────────────────────────────────────────
+# ─── 9) Streamlit-Oberfläche ────────────────────────────────────────────────
 st.set_page_config(page_title="PDF-Umbenenner", layout="centered")
-st.title("📄 PDF-Umbenenner (nur Vorname Nachname)")
+st.title("📄 PDF-Umbenenner (Bulletproof Persönlicher Name)")
 
-uploaded_files = st.file_uploader(
+uploaded = st.file_uploader(
     "PDF-Dateien hochladen (max. 200 MB/pro Datei)", 
     type="pdf", 
     accept_multiple_files=True
 )
 
-if uploaded_files:
-    results = []
-    errors = []
-
-    for f in uploaded_files:
+if uploaded:
+    results, errors = [], []
+    for f in uploaded:
         data = f.read()
         cname = extract_customer_name(data)
         if cname.startswith("Unbekannt_"):
             errors.append(f.name)
         safe = sanitize_filename(cname)
-        new_name = f"Vertragsauskunft {safe}.pdf"
-        results.append((f.name, new_name, data))
+        new_fn = f"Vertragsauskunft {safe}.pdf"
+        results.append((f.name, new_fn, data))
 
-    st.subheader("🔍 Vorschau der neuen Dateinamen")
+    st.subheader("🔍 Vorschau der umbenannten Dateien")
     for orig, new, _ in results:
         st.write(f"• **{orig}** ➔ {new}")
 
-    # ZIP-Paket erzeugen
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         for _, new, pdfdata in results:
@@ -135,6 +167,6 @@ if uploaded_files:
     )
 
     if errors:
-        st.warning("⚠️ Für diese Dateien wurde kein Vorname+Nachname erkannt:")
+        st.warning("⚠️ Für diese Dateien wurde kein Name erkannt:")
         for e in errors:
             st.write(f"- {e}")
