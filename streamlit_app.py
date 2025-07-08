@@ -1,73 +1,94 @@
 import streamlit as st
-import fitz                        # PyMuPDF
-import pytesseract
-from PIL import Image
+import fitz       # PyMuPDF
 import io, re, zipfile
 from datetime import datetime
 
-# ─── OCR auf einem Bild-Pillow-Objekt ─────────────────────────────────────────
-def ocr_image(img: Image.Image) -> str:
-    return pytesseract.image_to_string(img, lang="deu")
+# ─── Text-Extraktion aus PDF ─────────────────────────────────────────────────
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    text = ""
+    for page in doc:
+        text += page.get_text() + "\n"
+    doc.close()
+    return text
 
-# ─── PageCrop + OCR ──────────────────────────────────────────────────────────
-def ocr_crop(page, rel_box: tuple[float,float,float,float]) -> str:
-    """
-    Crop-Box = (x0%, y0%, x1%, y1%) in relativen Koordinaten [0..1].
-    Liefert den OCR-Text aus diesem Ausschnitt.
-    """
+# ─── Name im gelben Rechteck finden (PDF-Text only) ──────────────────────────
+def extract_name_in_yellow_text(pdf_bytes: bytes) -> str | None:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[0]
     w, h = page.rect.width, page.rect.height
-    x0, y0, x1, y1 = rel_box
-    rect = fitz.Rect(x0 * w, y0 * h, x1 * w, y1 * h)
-    pix = page.get_pixmap(clip=rect, dpi=200)
-    img = Image.open(io.BytesIO(pix.tobytes()))
-    return ocr_image(img)
+    blocks = page.get_text("dict")["blocks"]
+    doc.close()
 
-# ─── Name aus Text per Regex extrahieren ─────────────────────────────────────
-def find_name_in_text(text: str) -> str | None:
-    """
-    Sucht Zeilen mit 2–4 Wörtern, jeweils Großanfang.
-    Z.B. "Mag. jur. Caroline Gasser" oder "Philipp Gmachl"
-    """
+    # gelb markierter Bereich:
+    x_min, x_max = w * 0.45, w * 0.85
+    y_min, y_max = h * 0.12, h * 0.20
+
+    for blk in blocks:
+        x0, y0, _, _ = blk["bbox"]
+        if not (x_min < x0 < x_max and y_min < y0 < y_max):
+            continue
+
+        # Block-Text zusammenfügen
+        text = " ".join(
+            span["text"]
+            for line in blk["lines"]
+            for span in line["spans"]
+        ).strip()
+        text = re.sub(r"\s+", " ", text)
+
+        # Kein reines Nummern-Gefolge
+        if re.search(r"\d", text):
+            continue
+
+        # Person (2–4 Wörter) oder Firma (…GmbH)
+        if re.match(r"^[A-ZÄÖÜ][a-zäöüß]+(?: [A-ZÄÖÜ][a-zäöüß]+){1,3}$", text) \
+        or text.endswith("GmbH"):
+            return text
+
+    return None
+
+# ─── Heuristischer Fallback über gesamten Text ──────────────────────────────
+def extract_name_fallback(text: str) -> str | None:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    pattern = re.compile(r"^([A-ZÄÖÜ][^\s]+\s){1,3}[A-ZÄÖÜ][^\s]+$")
+    # 1) Suche „Geb.datum“-Zeile
     for line in lines:
-        if pattern.match(line):
+        if "geb.datum" in line.lower():
+            cand = line.split("geb.datum")[0].strip()
+            if re.match(r"^[A-Za-zÄÖÜäöüß ]+$", cand):
+                return cand
+    # 2) Erste 5 Zeilen auf Vorname Nachname
+    for line in lines[:5]:
+        if re.match(r"^[A-ZÄÖÜ][a-zäöüß]+ [A-ZÄÖÜ][a-zäöüß]+", line):
             return line
     return None
 
-# ─── Gesamt-Extraktion für ein PDF ───────────────────────────────────────────
+# ─── Gesamt-Extraktion ──────────────────────────────────────────────────────
 def extract_customer_name(pdf_bytes: bytes) -> str:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[0]
-
-    # 1) Enge Box (gelb markiert)
-    text = ocr_crop(page, (0.45, 0.12, 0.85, 0.20))
-    name = find_name_in_text(text)
+    # 1) Gelber Bereich via PDF-Text
+    name = extract_name_in_yellow_text(pdf_bytes)
     if name:
-        doc.close()
         return name
-
-    # 2) Weiter Box (OCR-Fallback)
-    text2 = ocr_crop(page, (0.10, 0.20, 0.90, 0.40))
-    name2 = find_name_in_text(text2)
-    doc.close()
-    if name2:
-        return name2
-
-    # 3) Letzter Ausweg: Markiere Unbekannt mit Zeitstempel
+    # 2) Fallback via gesamtem PDF-Text
+    full = extract_pdf_text(pdf_bytes)
+    fb = extract_name_fallback(full)
+    if fb:
+        return fb
+    # 3) Zeitstempel
     return f"Unbekannt_{datetime.now():%Y%m%d_%H%M%S}"
 
-# ─── Bereinige Dateinamen (Sonderzeichen weg, Spaces behalten) ──────────────
+# ─── Dateiname-Bereinigung ───────────────────────────────────────────────────
 def sanitize_filename(name: str) -> str:
+    # Sonderzeichen entfernen, Spaces erhalten
     return re.sub(r"[^\w\s]", "", name).strip()
 
-# ─── Streamlit-App ──────────────────────────────────────────────────────────
+# ─── Streamlit UI ───────────────────────────────────────────────────────────
 st.set_page_config(page_title="PDF-Umbenenner", layout="centered")
-st.title("📄 PDF-Umbenenner (mit exaktem Crop)")
+st.title("📄 PDF-Umbenenner (PDF-Text only)")
 
 files = st.file_uploader(
-    "PDF-Dateien hochladen (max. 200 MB/pro Datei)", 
-    type="pdf", 
+    "PDF-Dateien hochladen (max. 200 MB/pro Datei)",
+    type="pdf",
     accept_multiple_files=True
 )
 
@@ -100,6 +121,6 @@ if files:
     )
 
     if errors:
-        st.warning("⚠️ Bei diesen Dateien kein Name gefunden:")
+        st.warning("⚠️ Bei folgenden Dateien kein Name gefunden:")
         for e in errors:
             st.write(f"- {e}")
