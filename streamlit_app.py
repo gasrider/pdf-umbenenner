@@ -5,132 +5,99 @@ import re
 import zipfile
 from datetime import datetime
 
-# ─── PDF-Text Extraktion ─────────────────────────────────────────────────────
-def extract_pdf_text(pdf_bytes: bytes) -> str:
-    """
-    Liest den gesamten eingebetteten Text aus dem PDF.
-    """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    all_text = ""
-    for page in doc:
-        all_text += page.get_text() + "\n"
-    doc.close()
-    return all_text
-
-# ─── Name im gelben Bereich per PDF-Text ────────────────────────────────────
-def extract_name_in_yellow_text(pdf_bytes: bytes) -> str | None:
-    """
-    Sucht im rechten oberen (gelb markierten) Bereich nach Namen.
-    Bereich: 45–85% Breite, 12–20% Höhe.
-    """
+# ─── 1) PDFs lesen und Blöcke sortieren ───────────────────────────────────────
+def get_sorted_blocks(pdf_bytes: bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
-    w, h = page.rect.width, page.rect.height
-    blocks = page.get_text("dict")["blocks"]
-    doc.close()
-
-    x_min, x_max = w * 0.45, w * 0.85
-    y_min, y_max = h * 0.12, h * 0.20
-
-    for blk in blocks:
-        x0, y0, _, _ = blk["bbox"]
-        if not (x_min < x0 < x_max and y_min < y0 < y_max):
-            continue
-
-        # Fasse den Block-Text zusammen
+    blocks = []
+    for blk in page.get_text("dict")["blocks"]:
+        # Block-Koordinaten, ganzer Block-Text
+        x0, y0, x1, y1 = blk["bbox"]
         text = " ".join(
             span["text"] for line in blk["lines"] for span in line["spans"]
         ).strip()
-        # Mehrfachspacings entfernen
         text = re.sub(r"\s+", " ", text)
+        if text:
+            blocks.append((y0, text))
+    doc.close()
+    # Nach oberer Y-Koordinate sortieren (vom oberen Rand nach unten)
+    return sorted(blocks, key=lambda t: t[0])
 
-        # Wenn Ziffern drin, skip
-        if re.search(r"\d", text):
-            continue
-
-        # Privatperson (2–4 Wörter, jeder Großanfang)
-        if re.match(r"^[A-ZÄÖÜ][a-zäöüß]+(?: [A-ZÄÖÜ][a-zäöüß]+){1,3}$", text):
-            return text
-        # Firma endet auf GmbH
-        if text.endswith("GmbH"):
-            return text
-
+# ─── 2) Kundenname extrahieren über Adress-Block-Position ────────────────────
+def extract_name_via_address(pdf_bytes: bytes) -> str | None:
+    blocks = get_sorted_blocks(pdf_bytes)
+    street_kw = ["straße","strasse","weg","gasse","platz","allee"]
+    # Suche nach dem ersten Block, der eine Straße enthält
+    for idx, (_, text) in enumerate(blocks):
+        low = text.lower()
+        if any(kw in low for kw in street_kw):
+            # Kandidat direkt davor
+            if idx > 0:
+                cand = blocks[idx-1][1]
+                # Nur Buchstaben und Leerzeichen
+                if re.match(r"^[A-Za-zÄÖÜäöüß .°\-/]+$", cand):
+                    return cand
     return None
 
-# ─── Heuristischer Fallback auf Gesamtext ───────────────────────────────────
+# ─── 3) Heuristischer Fallback über Gesamttext ───────────────────────────────
 def extract_name_fallback(full_text: str) -> str | None:
-    """
-    1) Zeile oberhalb einer Adresszeile (Straßenkennung)
-    2) Zeile vor 'Geb.datum'
-    3) Erste 5 Zeilen 'Vorname Nachname'
-    """
     lines = [l.strip() for l in full_text.splitlines() if l.strip()]
-    street_kw = ["straße","strasse","weg","gasse","platz","allee"]
-
-    # 1) Über Adresse
-    for i, line in enumerate(lines):
-        if any(kw in line.lower() for kw in street_kw) and i > 0:
-            cand = lines[i-1]
-            if re.match(r"^[A-Za-zÄÖÜäöüß ]+$", cand):
-                return cand
-
-    # 2) Vor Geb.datum
+    # a) Vor 'Geb.datum'
     for line in lines:
         if "geb.datum" in line.lower():
-            p = line.split("geb.datum")[0].strip()
-            if re.match(r"^[A-Za-zÄÖÜäöüß ]+$", p):
-                return p
-
-    # 3) Erste 5 Zeilen
+            cand = line.split("geb.datum")[0].strip()
+            if re.match(r"^[A-Za-zÄÖÜäöüß ]+$", cand):
+                return cand
+    # b) Erste 5 Zeilen 'Vorname Nachname'
     for line in lines[:5]:
         if re.match(r"^[A-ZÄÖÜ][a-zäöüß]+ [A-ZÄÖÜ][a-zäöüß]+", line):
             return line
-
     return None
 
-# ─── Gesamt-Extraktion ──────────────────────────────────────────────────────
+# ─── 4) Vollständige Extraktion ─────────────────────────────────────────────
 def extract_customer_name(pdf_bytes: bytes) -> str:
-    # 1) Gelber Bereich
-    name = extract_name_in_yellow_text(pdf_bytes)
+    # per Block-Position
+    name = extract_name_via_address(pdf_bytes)
     if name:
         return name
 
-    # 2) Fallback per Gesamtext
-    full = extract_pdf_text(pdf_bytes)
+    # gesamter Text als Fallback
+    doc_text = get_sorted_blocks(pdf_bytes)
+    full = "\n".join(t for _, t in doc_text)
     fb = extract_name_fallback(full)
     if fb:
         return fb
 
-    # 3) Letzter Ausweg
-    return f"Unbekannt_{datetime.now():%Y%m%d_%H%M%S}"
+    # falls gar nichts passt
+    return f"Unbekannt_{datetime.now():%Y%m%d%H%M%S}"
 
-# ─── Dateiname bereinigen ────────────────────────────────────────────────────
+# ─── 5) Dateiname sanitisieren ───────────────────────────────────────────────
 def sanitize_filename(name: str) -> str:
-    # Entfernt Sonderzeichen, belässt Buchstaben, Zahlen und Leerzeichen
+    # Sonderzeichen entfernen, Leerzeichen behalten
     return re.sub(r"[^\w\s]", "", name).strip()
 
-# ─── Streamlit-App ──────────────────────────────────────────────────────────
+# ─── 6) Streamlit UI ─────────────────────────────────────────────────────────
 st.set_page_config(page_title="PDF-Umbenenner", layout="centered")
-st.title("📄 PDF-Umbenenner (rein PDF-Text, kein OCR)")
+st.title("📄 PDF-Umbenenner (Name über Adresse)")
 
-uploaded = st.file_uploader(
+uploads = st.file_uploader(
     "PDF-Dateien hochladen (max. 200 MB/pro Datei)",
     type="pdf",
     accept_multiple_files=True
 )
 
-if uploaded:
+if uploads:
     results, errors = [], []
-    for f in uploaded:
+    for f in uploads:
         data = f.read()
         cust = extract_customer_name(data)
         if cust.startswith("Unbekannt_"):
             errors.append(f.name)
         safe = sanitize_filename(cust)
-        new_name = f"Vertragsauskunft {safe}.pdf"
-        results.append((f.name, new_name, data))
+        new_fn = f"Vertragsauskunft {safe}.pdf"
+        results.append((f.name, new_fn, data))
 
-    st.subheader("🔍 Vorschau der umbenannten Dateien")
+    st.subheader("🔍 Vorschau der neuen Dateinamen")
     for orig, new, _ in results:
         st.write(f"• **{orig}** ➔ {new}")
 
@@ -141,13 +108,13 @@ if uploaded:
     buf.seek(0)
 
     st.download_button(
-        "📦 ZIP herunterladen",
+        "📦 ZIP herunterladen mit umbenannten PDFs",
         buf,
         file_name="umbenannte_pdfs.zip",
         mime="application/zip"
     )
 
     if errors:
-        st.warning("⚠️ Für diese Dateien wurde kein Name gefunden:")
+        st.warning("⚠️ Kein Name gefunden in:")
         for e in errors:
             st.write(f"- {e}")
