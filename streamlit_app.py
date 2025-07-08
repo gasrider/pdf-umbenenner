@@ -3,6 +3,9 @@ import fitz     # PyMuPDF
 import io, re, zipfile
 from datetime import datetime
 
+# ─── DEBUG-Flag ──────────────────────────────────────────────────────────────
+DEBUG = True
+
 # ─── 1) Header-Blacklist (oberste 20 %) ─────────────────────────────────────
 def collect_header_blacklist(data: bytes) -> set[str]:
     doc = fitz.open(stream=data, filetype="pdf")
@@ -13,17 +16,12 @@ def collect_header_blacklist(data: bytes) -> set[str]:
 
     bl = set()
     for b in raw:
-        if b.get("type") != 0 or "lines" not in b:
-            continue
+        if b.get("type")!=0 or "lines" not in b: continue
         y0 = b["bbox"][1]
-        if y0 > cutoff:
-            continue
-        txt = " ".join(
-            span["text"] for line in b["lines"] for span in line["spans"]
-        ).strip()
-        txt = re.sub(r"\s+", " ", txt)
-        if txt:
-            bl.add(txt)
+        if y0 > cutoff: continue
+        txt = " ".join(span["text"] for line in b["lines"] for span in line["spans"])
+        txt = re.sub(r"\s+"," ",txt).strip()
+        if txt: bl.add(txt)
     return bl
 
 # ─── 2) Textblöcke sortieren ─────────────────────────────────────────────────
@@ -32,32 +30,30 @@ def get_sorted_blocks(data: bytes) -> list[tuple[float,float,str]]:
     raw = doc[0].get_text("dict")["blocks"]
     doc.close()
 
-    out = []
+    out=[]
     for b in raw:
-        if b.get("type") != 0 or "lines" not in b:
-            continue
-        y0, x0 = b["bbox"][1], b["bbox"][0]
-        txt = " ".join(
-            span["text"] for line in b["lines"] for span in line["spans"]
-        ).strip()
-        txt = re.sub(r"\s+", " ", txt)
+        if b.get("type")!=0 or "lines" not in b: continue
+        y0,x0 = b["bbox"][1], b["bbox"][0]
+        txt = " ".join(span["text"] for line in b["lines"] for span in line["spans"])
+        txt = re.sub(r"\s+"," ",txt).strip()
         if txt:
-            out.append((y0, x0, txt))
-    return sorted(out, key=lambda x: x[0])
+            out.append((y0,x0,txt))
+    return sorted(out, key=lambda x: (x[0], x[1]))
 
 # ─── 3) Name direkt nach „KdNr“ extrahieren ─────────────────────────────────
-def extract_after_kdnr(data: bytes, blacklist: set[str]) -> str | None:
+def extract_after_kdnr(data: bytes, blacklist: set[str]) -> str|None:
     blocks = get_sorted_blocks(data)
-    # Korrigierte Regex: 2–5 Tokens, Initial-Großbuchstabe, Punkte/Bindestriche erlaubt
     pattern = re.compile(
         r"^([A-ZÄÖÜ][A-Za-zäöüß\.\-]+(?: [A-ZÄÖÜ][A-Za-zäöüß\.\-]+){1,4})"
     )
-    for i, (_, _, txt) in enumerate(blocks):
-        if "kdnr" in txt.lower() and i + 1 < len(blocks):
+    for i,(y0,x0,txt) in enumerate(blocks):
+        if "kdnr" in txt.lower() and i+1 < len(blocks):
             cand = blocks[i+1][2]
             if cand not in blacklist:
                 m = pattern.match(cand)
                 if m:
+                    if DEBUG:
+                        st.write(f"→ extract_after_kdnr matched at y0={y0:.1f}, x0={x0:.1f}: '{cand}'")
                     return m.group(1)
     return None
 
@@ -76,43 +72,52 @@ def is_name_block(txt: str) -> bool:
         return False
     return all(re.match(r"^[A-ZÄÖÜ][A-Za-zäöüß\.\-]+$", t) for t in toks)
 
-def extract_over_address(data: bytes, blacklist: set[str]) -> str | None:
+def extract_over_address(data: bytes, blacklist: set[str]) -> str|None:
     blocks = get_sorted_blocks(data)
-    for i, (_, _, txt) in enumerate(blocks):
-        if txt in blacklist:
-            continue
-        if is_address_block(txt) and i > 0:
+    for i,(y0,x0,txt) in enumerate(blocks):
+        if txt in blacklist: continue
+        if is_address_block(txt) and i>0:
             cand = blocks[i-1][2]
             if cand not in blacklist and is_name_block(cand):
+                if DEBUG:
+                    st.write(f"→ extract_over_address matched above y0={y0:.1f}: '{cand}'")
                 return cand
     return None
 
-# ─── 5) Heuristischer Fallback ───────────────────────────────────────────────
-def extract_fallback(data: bytes) -> str | None:
+# ─── 5) Fallback über „Geb.datum“ oder Top-5 ─────────────────────────────────
+def extract_fallback(data: bytes) -> str|None:
     doc = fitz.open(stream=data, filetype="pdf")
     full = "".join(page.get_text() + "\n" for page in doc)
     doc.close()
     lines = [l.strip() for l in full.splitlines() if l.strip()]
-    # a) vor "Geb.datum"
+
     for l in lines:
         if "geb.datum" in l.lower():
             cand = l.split("geb.datum")[0].strip()
             if is_name_block(cand):
+                if DEBUG:
+                    st.write(f"→ extract_fallback matched before 'Geb.datum': '{cand}'")
                 return cand
-    # b) erste 5 Zeilen
+
     for l in lines[:5]:
         if is_name_block(l):
+            if DEBUG:
+                st.write(f"→ extract_fallback matched in top‐5: '{l}'")
             return l
+
     return None
 
-# ─── 6) Gesamtabfolge ────────────────────────────────────────────────────────
+# ─── 6) Komplett-Logik ────────────────────────────────────────────────────────
 def extract_customer_name(data: bytes) -> str:
     bl = collect_header_blacklist(data)
-    # a) KdNr-Logik
+    if DEBUG:
+        st.write("**Header-Blacklist:**", bl)
+
+    # a) KdNr
     n = extract_after_kdnr(data, bl)
     if n:
         return n
-    # b) Adresse oben
+    # b) Adresse
     n2 = extract_over_address(data, bl)
     if n2:
         return n2
@@ -120,18 +125,18 @@ def extract_customer_name(data: bytes) -> str:
     n3 = extract_fallback(data)
     if n3:
         return n3
-    # d) letzter Ausweg
+    # d) Ausweg
     return f"Unbekannt_{datetime.now():%Y%m%d%H%M%S}"
 
-# ─── 7) Dateinamen-Sanitizer ────────────────────────────────────────────────
+# ─── 7) Sanitize ─────────────────────────────────────────────────────────────
 def sanitize(name: str) -> str:
     return re.sub(r"[^\w\s]", "", name).strip()
 
-# ─── 8) Streamlit-Oberfläche ─────────────────────────────────────────────────
+# ─── 8) Streamlit UI ─────────────────────────────────────────────────────────
 st.set_page_config(page_title="PDF-Umbenenner", layout="centered")
-st.title("📄 PDF-Umbenenner (KdNr+Adresse+Fallback)")
+st.title("📄 PDF-Umbenenner (Debug-Modus an)")
 
-files = st.file_uploader("PDF-Dateien hochladen (max. 200 MB)", type="pdf", accept_multiple_files=True)
+files = st.file_uploader("PDFs hochladen (max.200 MB)", type="pdf", accept_multiple_files=True)
 if files:
     results, errs = [], []
     for f in files:
@@ -143,18 +148,18 @@ if files:
         new = f"Vertragsauskunft {safe}.pdf"
         results.append((f.name, new, data))
 
-    st.subheader("🔍 Vorschau der umbenannten Dateien")
-    for orig, new, _ in results:
+    st.subheader("🔍 Vorschau")
+    for orig,new,_ in results:
         st.write(f"• **{orig}** ➔ {new}")
 
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
-        for _, new, pdf in results:
+    with zipfile.ZipFile(buf,"w") as zf:
+        for _,new,pdf in results:
             zf.writestr(new, pdf)
     buf.seek(0)
-    st.download_button("📦 ZIP herunterladen", buf, "umbenannte_pdfs.zip", "application/zip")
+    st.download_button("📦 ZIP herunterladen", buf,"umbenannte_pdfs.zip","application/zip")
 
     if errs:
-        st.warning("⚠️ Für diese Dateien wurde kein Name erkannt:")
+        st.warning("⚠️ Kein Name erkannt:")
         for e in errs:
             st.write(f"- {e}")
